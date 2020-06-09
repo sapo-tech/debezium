@@ -38,7 +38,6 @@ import io.debezium.util.BoundedConcurrentHashMap;
  * {@link JdbcConnection} extension to be used with Microsoft SQL Server
  *
  * @author Horia Chiorean (hchiorea@redhat.com), Jiri Pechanec
- *
  */
 public class SqlServerConnection extends JdbcConnection {
 
@@ -50,11 +49,12 @@ public class SqlServerConnection extends JdbcConnection {
 
     private static final String STATEMENTS_PLACEHOLDER = "#";
     private static final String GET_MAX_LSN = "SELECT sys.fn_cdc_get_max_lsn()";
+    private static final String GET_MIN_LSN = "SELECT sys.fn_cdc_get_min_lsn('#')";
     private static final String LOCK_TABLE = "SELECT * FROM [#] WITH (TABLOCKX)";
     private static final String SQL_SERVER_VERSION = "SELECT @@VERSION AS 'SQL Server Version'";
     private final String lsnToTimestamp;
     private static final String INCREMENT_LSN = "SELECT sys.fn_cdc_increment_lsn(?)";
-    private static final String GET_ALL_CHANGES_FOR_TABLE = "SELECT * FROM cdc.[fn_cdc_get_all_changes_#](ISNULL(?,sys.fn_cdc_get_min_lsn('#')), ?, N'all update old')";
+    private static final String GET_ALL_CHANGES_FOR_TABLE = "SELECT * FROM cdc.[fn_cdc_get_all_changes_#](?, ?, N'all update old')";
     private static final String GET_LIST_OF_CDC_ENABLED_TABLES = "EXEC sys.sp_cdc_help_change_data_capture";
     private static final String GET_LIST_OF_NEW_CDC_ENABLED_TABLES = "SELECT * FROM cdc.change_tables WHERE start_lsn BETWEEN ? AND ?";
     private static final String GET_LIST_OF_KEY_COLUMNS = "SELECT * FROM cdc.index_columns WHERE object_id=?";
@@ -82,8 +82,7 @@ public class SqlServerConnection extends JdbcConnection {
     /**
      * Creates a new connection using the supplied configuration.
      *
-     * @param config
-     *            {@link Configuration} instance, may not be null.
+     * @param config {@link Configuration} instance, may not be null.
      */
     public SqlServerConnection(Configuration config) {
         super(config, FACTORY);
@@ -123,12 +122,21 @@ public class SqlServerConnection extends JdbcConnection {
         }, "Maximum LSN query must return exactly one value"));
     }
 
+    public Lsn getMinLsn(String changeTableName) throws SQLException {
+        String query = GET_MIN_LSN.replace(STATEMENTS_PLACEHOLDER, changeTableName);
+        return queryAndMap(query, singleResultMapper(rs -> {
+            final Lsn ret = Lsn.valueOf(rs.getBytes(1));
+            LOGGER.trace("Current minimum lsn is {}", ret);
+            return ret;
+        }, "Minimum LSN query must return exactly one value"));
+    }
+
     /**
      * Provides all changes recorded by the SQL Server CDC capture process for a given table.
      *
-     * @param tableId - the requested table changes
-     * @param fromLsn - closed lower bound of interval of changes to be provided
-     * @param toLsn  - closed upper bound of interval  of changes to be provided
+     * @param tableId  - the requested table changes
+     * @param fromLsn  - closed lower bound of interval of changes to be provided
+     * @param toLsn    - closed upper bound of interval  of changes to be provided
      * @param consumer - the change processor
      * @throws SQLException
      */
@@ -143,10 +151,10 @@ public class SqlServerConnection extends JdbcConnection {
     /**
      * Provides all changes recorder by the SQL Server CDC capture process for a set of tables.
      *
-     * @param changeTables - the requested tables to obtain changes for
+     * @param changeTables    - the requested tables to obtain changes for
      * @param intervalFromLsn - closed lower bound of interval of changes to be provided
-     * @param intervalToLsn  - closed upper bound of interval  of changes to be provided
-     * @param consumer - the change processor
+     * @param intervalToLsn   - closed upper bound of interval  of changes to be provided
+     * @param consumer        - the change processor
      * @throws SQLException
      */
     public void getChangesForTables(ChangeTable[] changeTables, Lsn intervalFromLsn, Lsn intervalToLsn, BlockingMultiResultSetConsumer consumer)
@@ -161,9 +169,14 @@ public class SqlServerConnection extends JdbcConnection {
             // If the table was added in the middle of queried buffer we need
             // to adjust from to the first LSN available
             final Lsn fromLsn = changeTable.getStartLsn().compareTo(intervalFromLsn) > 0 ? changeTable.getStartLsn() : intervalFromLsn;
+            // debug only
+            if (fromLsn.getBinary() == null) {
+                LOGGER.info("WHY FROM_LSN_BINARY_NULL");
+            }
+            Lsn fLsn = fromLsn.getBinary() == null ? getMinLsn(changeTable.getCaptureInstance()) : fromLsn;
             LOGGER.trace("Getting changes for table {} in range[{}, {}]", changeTable, fromLsn, intervalToLsn);
             preparers[idx] = statement -> {
-                statement.setBytes(1, fromLsn.getBinary());
+                statement.setBytes(1, fLsn.getBinary());
                 statement.setBytes(2, intervalToLsn.getBinary());
             };
 
